@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-GGBet (gg.bet) Esports Odds Scraper — v6 (2026-06-01)
+GGBet (gg.bet) Esports Odds Scraper — v7 (2026-06-01)
 
-Fixes vs v5:
-  - Scroll to bottom repeatedly to trigger lazy-load of all matches
-  - Stricter team name validation (no numeric labels, no "powyżej X", no same-team-both-sides)
-  - Match URL extracted from anchor href inside match element
-  - Start time extracted from time/date elements
-  - Tournament name: strip PL locale prefix ("Zakłady na ", "Obstawianie ")
+DOM structure (confirmed):
+  Each match = <a data-test="sport-event-row-body-link" href="/pl/esports/match/...">
+  Inside each match: 18 odd-buttons (6 markets × 3 outcomes)
+  We want the first market (Match Winner = first 2 or 3 buttons)
+
+Fixes vs v6:
+  - Group by data-test="sport-event-row-body-link" anchor — exact match container
+  - Strip /pl/ locale prefix from match URLs
+  - Extract start time from within the match anchor
+  - Extract tournament from the section heading above each group of matches
+  - Match Winner = odd-buttons inside data-test="top-markets" only (first market block)
 """
 import asyncio
 import logging
@@ -51,21 +56,6 @@ VIRTUAL_RE = re.compile(
     re.IGNORECASE,
 )
 
-# PL locale tournament name prefixes to strip
-TOURNEY_STRIP_RE = re.compile(
-    r"^(Zakłady na |Obstawianie |Esport zakłady|Bet on )",
-    re.IGNORECASE,
-)
-
-# Labels that are NOT team names — filter these out of match winner candidates
-INVALID_LABEL_RE = re.compile(
-    r"^[+-]?\d+\.?\d*$|"           # pure numbers / handicap lines like -1.5
-    r"powyżej|poniżej|over|under|"  # total lines
-    r"^(yes|no|draw|x)$|"          # other markets
-    r"remis|bukmacher",             # PL words
-    re.IGNORECASE,
-)
-
 STEALTH_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
 Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
@@ -76,17 +66,14 @@ window.chrome = {runtime: {}};
 JS_DISCOVER_GAMES = """
 () => {
     const seen = new Set();
-    const esportSlugs = [
-        'counter-strike','cs2','dota2','dota-2','valorant',
-        'league-of-legends','mobile-legends','overwatch',
-        'rainbow-six','call-of-duty','rocket-league','starcraft2',
-        'starcraft-2','pubg','king-of-glory'
-    ];
+    const slugs = ['counter-strike','cs2','dota2','valorant','league-of-legends',
+        'mobile-legends','overwatch','rainbow-six','call-of-duty','rocket-league',
+        'starcraft2','pubg','king-of-glory'];
     const results = [];
     document.querySelectorAll('a[href]').forEach(a => {
         const href = a.getAttribute('href') || '';
         const m = href.match(/^\\/([a-z0-9-]+)$/);
-        if (m && esportSlugs.includes(m[1]) && !seen.has(href)) {
+        if (m && slugs.includes(m[1]) && !seen.has(href)) {
             seen.add(href);
             results.push({text: a.textContent.trim() || m[1], url: 'https://gg.bet' + href});
         }
@@ -95,62 +82,30 @@ JS_DISCOVER_GAMES = """
 }
 """
 
-# Scroll to load all lazy-loaded matches then extract
-JS_SCROLL_AND_COUNT = """
-async () => {
-    // Scroll in steps to trigger virtual-list rendering
-    const delay = ms => new Promise(r => setTimeout(r, ms));
-    let prev = 0;
-    for (let i = 0; i < 20; i++) {
-        window.scrollTo(0, document.body.scrollHeight);
-        await delay(800);
-        const cur = document.querySelectorAll('[data-test*="odd-button"]').length;
-        if (cur === prev && i > 3) break;
-        prev = cur;
-    }
-    window.scrollTo(0, 0);
-    await delay(500);
-    return document.querySelectorAll('[data-test*="odd-button"]').length;
-}
-"""
-
-JS_EXTRACT_MATCHES = """
+# Core extractor — uses confirmed DOM structure
+JS_EXTRACT = """
 () => {
     const records = [];
     const seen = new Set();
-    const oddBtns = Array.from(document.querySelectorAll('[data-test*="odd-button"]'));
 
-    // Group odd buttons by closest match-level parent
-    const matchMap = new Map();
-    for (const btn of oddBtns) {
-        let matchEl = null;
-        let cur = btn.parentElement;
-        for (let i = 0; i < 12 && cur && cur !== document.body; i++) {
-            const dt  = (cur.getAttribute('data-test') || '').toLowerCase();
-            const cls = (cur.className || '').toLowerCase();
-            if (
-                dt.includes('match') || dt.includes('event-row') || dt.includes('game-row') ||
-                cls.includes('matchcard') || cls.includes('match-row') || cls.includes('eventcard') ||
-                cls.includes('event-row') || cls.includes('sportsevent') || cls.includes('sports-event')
-            ) {
-                matchEl = cur;
-                break;
-            }
-            cur = cur.parentElement;
-        }
-        if (!matchEl) matchEl = btn.parentElement?.parentElement?.parentElement || btn.parentElement;
-        if (!matchEl || matchEl === document.body) continue;
-        if (!matchMap.has(matchEl)) matchMap.set(matchEl, []);
-        matchMap.get(matchEl).push(btn);
-    }
+    // Each match is wrapped in <a data-test="sport-event-row-body-link">
+    const matchLinks = document.querySelectorAll('a[data-test="sport-event-row-body-link"]');
 
-    for (const [matchEl, btns] of matchMap.entries()) {
-        if (btns.length < 2) continue;
+    for (const matchEl of matchLinks) {
+        const rawHref = matchEl.getAttribute('href') || '';
+        // Strip locale prefix: /pl/esports/match/... -> /esports/match/...
+        const href = rawHref.replace(/^\\/[a-z]{2}\\//, '/');
+        const matchUrl = href ? 'https://gg.bet' + href : '';
 
-        // Parse each button — extract first numeric value + first string label
-        const parsedOdds = [];
+        // Odd-buttons: only from the first market block (data-test="top-markets")
+        // Each market block is a DIV[data-test="top-markets"]
+        // The Match Winner market is the one with team names as labels
+        const allOddBtns = Array.from(matchEl.querySelectorAll('[data-test*="odd-button"]'));
+
+        // Extract leaf text from each button: label + numeric value
+        const parsedBtns = [];
         const btnSeen = new Set();
-        for (const btn of btns) {
+        for (const btn of allOddBtns) {
             let label = '';
             let value = null;
             const walker = document.createTreeWalker(btn, NodeFilter.SHOW_TEXT, null);
@@ -166,15 +121,14 @@ JS_EXTRACT_MATCHES = """
                 }
             }
             if (value === null) continue;
-            const key = label + ':' + value;
-            if (!btnSeen.has(key)) { btnSeen.add(key); parsedOdds.push({label, value}); }
+            const k = label + ':' + value;
+            if (!btnSeen.has(k)) { btnSeen.add(k); parsedBtns.push({label, value}); }
         }
 
-        if (parsedOdds.length < 2) continue;
+        // Filter to Match Winner candidates: reject numeric labels, PL locale words, draw/over/under
+        const invalidRe = /^[+\-]?\d+[.,]?\d*$|powyżej|poniżej|over|under|^(yes|no|draw|x|remis)$/i;
+        const mw = parsedBtns.filter(o => o.label && !invalidRe.test(o.label.trim()));
 
-        // Keep only Match Winner candidates — strip handicap/total/draw labels
-        const invalidRe = /^[+\-]?\d+\.?\d*$|powyżej|poniżej|over|under|^(yes|no|draw|x|remis)$/i;
-        const mw = parsedOdds.filter(o => o.label && !invalidRe.test(o.label.trim()));
         if (mw.length < 2) continue;
 
         const team1 = mw[0].label.trim();
@@ -190,41 +144,34 @@ JS_EXTRACT_MATCHES = """
             p2    = mw[1].value;
         }
 
-        // Skip if team names are the same (bad parse)
         if (!team1 || !team2 || team1.toLowerCase() === team2.toLowerCase()) continue;
 
-        // Tournament name — walk up to find heading
-        let tournament = '';
-        let cur2 = matchEl.parentElement;
-        for (let i = 0; i < 10 && cur2 && cur2 !== document.body; i++) {
-            const h = cur2.querySelector(
-                'h1,h2,h3,h4,[class*="tournament"],[class*="league"],[class*="group-title"],[class*="section-title"],[class*="sport-title"]'
-            );
-            if (h) { tournament = h.textContent.trim().split('\\n')[0].trim(); break; }
-            cur2 = cur2.parentElement;
-        }
-
-        // Start time — look for time/date elements
+        // Start time — look for time elements or date-like text nodes
         let startTime = '';
-        const timeEl = matchEl.querySelector(
-            'time,[class*="start-time"],[class*="StartTime"],[class*="match-time"],[class*="MatchTime"],[data-test*="time"]'
-        );
+        const timeEl = matchEl.querySelector('time,[data-test*="time"],[class*="start-time"],[class*="StartTime"]');
         if (timeEl) {
             startTime = timeEl.getAttribute('datetime') || timeEl.textContent.trim();
         }
+        // Fallback: text nodes that look like times "HH:MM" or dates
+        if (!startTime) {
+            const allText = matchEl.innerText || '';
+            const timeMatch = allText.match(/\b(\d{1,2}:\d{2})\b/);
+            if (timeMatch) startTime = timeMatch[1];
+        }
 
-        // Match URL — find anchor linking to /esports/match/
-        let matchUrl = '';
-        const linkEl = matchEl.querySelector('a[href*="/esports/match/"]') ||
-                       matchEl.closest('a[href*="/esports/match/"]');
-        if (linkEl) matchUrl = 'https://gg.bet' + linkEl.getAttribute('href');
-
-        // Also try the whole match element as a link
-        if (!matchUrl) {
-            const selfHref = matchEl.getAttribute('href');
-            if (selfHref && selfHref.includes('/esports/match/')) {
-                matchUrl = 'https://gg.bet' + selfHref;
+        // Tournament: walk up from matchEl to find a heading/label above the match group
+        let tournament = '';
+        let cur = matchEl.parentElement;
+        for (let i = 0; i < 10 && cur && cur !== document.body; i++) {
+            const h = cur.querySelector('h1,h2,h3,h4,[class*="sport-name"],[class*="SportName"],[class*="tournament"],[class*="league"],[class*="section-title"],[class*="group-title"]');
+            if (h) {
+                const t = h.textContent.trim().split('\\n')[0].trim();
+                if (t && t.length > 1 && t.length < 100 && !t.includes('GGBET')) {
+                    tournament = t;
+                    break;
+                }
             }
+            cur = cur.parentElement;
         }
 
         const key = team1.toLowerCase() + '|' + team2.toLowerCase();
@@ -237,51 +184,45 @@ JS_EXTRACT_MATCHES = """
 }
 """
 
-
-def clean_tournament(name: str) -> str:
-    return TOURNEY_STRIP_RE.sub("", name).strip()
+JS_SCROLL = """
+async () => {
+    const delay = ms => new Promise(r => setTimeout(r, ms));
+    let prev = 0;
+    for (let i = 0; i < 15; i++) {
+        window.scrollTo(0, document.body.scrollHeight);
+        await delay(1000);
+        const cur = document.querySelectorAll('a[data-test="sport-event-row-body-link"]').length;
+        if (cur === prev && i > 3) break;
+        prev = cur;
+    }
+    window.scrollTo(0, 0);
+    await delay(300);
+    return document.querySelectorAll('a[data-test="sport-event-row-body-link"]').length;
+}
+"""
 
 
 def is_virtual(tournament: str, game_label: str) -> bool:
     return bool(VIRTUAL_RE.search(tournament) or VIRTUAL_RE.search(game_label))
 
 
-def is_valid_team(name: str) -> bool:
-    if not name or len(name) < 2:
-        return False
-    if INVALID_LABEL_RE.search(name):
-        return False
-    return True
-
-
 async def make_browser(pw, proxy_url: str):
-    parts  = proxy_url.replace("http://", "").split("@")
-    creds  = parts[0]
+    parts = proxy_url.replace("http://", "").split("@")
+    user, pwd = parts[0].split(":", 1)
     server = "http://" + parts[1]
-    user, pwd = creds.split(":", 1)
-
     browser = await pw.chromium.launch(
         headless=True,
-        args=[
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-blink-features=AutomationControlled",
-            "--disable-web-security",
-        ],
+        args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
+              "--disable-blink-features=AutomationControlled"],
         proxy={"server": server, "username": user, "password": pwd},
     )
-    context = await browser.new_context(
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/136.0.0.0 Safari/537.36"
-        ),
+    ctx = await browser.new_context(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
         locale="en-US",
         viewport={"width": 1280, "height": 900},
     )
-    await context.add_init_script(STEALTH_SCRIPT)
-    return browser, context
+    await ctx.add_init_script(STEALTH_SCRIPT)
+    return browser, ctx
 
 
 async def scrape_game_page(page, game_label: str, url: str, now: str) -> List[Dict]:
@@ -289,42 +230,29 @@ async def scrape_game_page(page, game_label: str, url: str, now: str) -> List[Di
     logger.info(f"  Fetching {game_label}: {url}")
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        await asyncio.sleep(10)  # CF + initial SPA hydration
+        await asyncio.sleep(10)
     except Exception as e:
         logger.warning(f"  Nav failed {game_label}: {e}")
         return records
 
-    # Scroll repeatedly to trigger lazy-load until odd-button count stabilises
     try:
-        count_before = await page.evaluate(
-            "() => document.querySelectorAll('[data-test*=\"odd-button\"]').length"
-        )
-        total_btns = await page.evaluate(JS_SCROLL_AND_COUNT)
-        logger.info(f"  {game_label}: odd-buttons before={count_before} after scroll={total_btns}")
+        total = await page.evaluate(JS_SCROLL)
+        logger.info(f"  {game_label}: {total} match links after scroll")
     except Exception as e:
         logger.warning(f"  Scroll error {game_label}: {e}")
 
     try:
-        raw = await page.evaluate(JS_EXTRACT_MATCHES)
-        logger.info(f"  {game_label}: {len(raw)} raw records extracted")
+        raw = await page.evaluate(JS_EXTRACT)
+        logger.info(f"  {game_label}: {len(raw)} raw records")
         for item in raw:
             team1      = (item.get("team1") or "").strip()
             team2      = (item.get("team2") or "").strip()
-            tournament = clean_tournament((item.get("tournament") or "").strip())
-            p1         = item.get("p1")
-            p2         = item.get("p2")
-
-            if not is_valid_team(team1) or not is_valid_team(team2):
-                logger.info(f"  Skip invalid teams: '{team1}' / '{team2}'")
-                continue
-            if team1.lower() == team2.lower():
-                logger.info(f"  Skip same-team duplicate: '{team1}'")
-                continue
-            if not p1 or not p2:
+            tournament = (item.get("tournament") or "").strip()
+            p1, p2     = item.get("p1"), item.get("p2")
+            if not team1 or not team2 or not p1 or not p2:
                 continue
             if is_virtual(tournament, game_label):
                 continue
-
             records.append({
                 "bookmaker":        "ggbet",
                 "game_raw":         game_label,
@@ -342,7 +270,6 @@ async def scrape_game_page(page, game_label: str, url: str, now: str) -> List[Di
             })
     except Exception as e:
         logger.error(f"  Extraction error {game_label}: {e}")
-
     return records
 
 
@@ -350,8 +277,7 @@ async def main() -> None:
     async with Actor() as actor:
         inp         = await actor.get_input() or {}
         max_matches = inp.get("max_matches", 1000)
-
-        actor.log.info(f"GGBet DOM scraper v6 | Oxylabs+stealth+scroll | max={max_matches}")
+        actor.log.info(f"GGBet DOM scraper v7 | sport-event-row-body-link | max={max_matches}")
 
         now = datetime.now(timezone.utc).isoformat()
         all_records: List[Dict] = []
@@ -378,22 +304,16 @@ async def main() -> None:
                         pass
 
             if not page:
-                actor.log.error("All proxies failed — aborting")
+                actor.log.error("All proxies failed")
                 return
 
-            # Discover game URLs from footer
             try:
                 discovered = await page.evaluate(JS_DISCOVER_GAMES)
-                if discovered and len(discovered) >= 3:
-                    game_list = [(r["text"], r["url"]) for r in discovered]
-                    actor.log.info(f"Discovered {len(game_list)} games from DOM")
-                else:
-                    game_list = ESPORT_GAMES_DEFAULT
-                    actor.log.info("Using default game list")
+                game_list = [(r["text"], r["url"]) for r in discovered] if discovered and len(discovered) >= 3 else ESPORT_GAMES_DEFAULT
+                actor.log.info(f"Game list: {[g for g, _ in game_list]}")
             except Exception:
                 game_list = ESPORT_GAMES_DEFAULT
 
-            # Scrape each game
             for game_label, url in game_list:
                 if len(all_records) >= max_matches:
                     break
@@ -411,13 +331,11 @@ async def main() -> None:
         actor.log.info(f"Total unique records: {len(all_records)}")
         for rec in all_records[:max_matches]:
             await actor.push_data(rec)
-
         await actor.push_data({
-            "_meta":         True,
-            "bookmaker":     "ggbet",
+            "_meta": True, "bookmaker": "ggbet",
             "records_total": min(len(all_records), max_matches),
-            "method":        "playwright_dom_v6_scroll",
-            "scraped_at":    now,
+            "method": "playwright_dom_v7_match_anchor",
+            "scraped_at": now,
         })
         actor.log.info("Done.")
 
