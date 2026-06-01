@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GGBet (gg.bet) Esports Odds Scraper — v7 (2026-06-01)
+GGBet (gg.bet) Esports Odds Scraper — v8 (2026-06-01)
 
 DOM structure (confirmed):
   Each match = <a data-test="sport-event-row-body-link" href="/pl/esports/match/...">
@@ -146,18 +146,11 @@ JS_EXTRACT = """
 
         if (!team1 || !team2 || team1.toLowerCase() === team2.toLowerCase()) continue;
 
-        // Start time — look for time elements or date-like text nodes
+        // Start time — first line of innerText is always "HH:MM" (confirmed from DOM)
         let startTime = '';
-        const timeEl = matchEl.querySelector('time,[data-test*="time"],[class*="start-time"],[class*="StartTime"]');
-        if (timeEl) {
-            startTime = timeEl.getAttribute('datetime') || timeEl.textContent.trim();
-        }
-        // Fallback: text nodes that look like times "HH:MM" or dates
-        if (!startTime) {
-            const allText = matchEl.innerText || '';
-            const timeMatch = allText.match(/\b(\d{1,2}:\d{2})\b/);
-            if (timeMatch) startTime = timeMatch[1];
-        }
+        const allText = matchEl.innerText || '';
+        const timeMatch = allText.match(/(\d{1,2}:\d{2})/);
+        if (timeMatch) startTime = timeMatch[1];
 
         // Tournament: walk up from matchEl to find a heading/label above the match group
         let tournament = '';
@@ -167,7 +160,8 @@ JS_EXTRACT = """
             if (h) {
                 const t = h.textContent.trim().split('\\n')[0].trim();
                 if (t && t.length > 1 && t.length < 100 && !t.includes('GGBET')) {
-                    tournament = t;
+                    // Strip PL locale prefixes
+                    tournament = t.replace(/^(Obstawianie |Zakłady na |Obstawiaj |Bet on |Apostas em |Apuestas de )/i, '').trim();
                     break;
                 }
             }
@@ -277,7 +271,7 @@ async def main() -> None:
     async with Actor() as actor:
         inp         = await actor.get_input() or {}
         max_matches = inp.get("max_matches", 1000)
-        actor.log.info(f"GGBet DOM scraper v7 | sport-event-row-body-link | max={max_matches}")
+        actor.log.info(f"GGBet DOM scraper v8 | sport-event-row-body-link | max={max_matches}")
 
         now = datetime.now(timezone.utc).isoformat()
         all_records: List[Dict] = []
