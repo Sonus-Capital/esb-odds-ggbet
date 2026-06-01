@@ -328,7 +328,7 @@ async def main() -> None:
         await actor.push_data({
             "_meta": True, "bookmaker": "ggbet",
             "records_total": min(len(all_records), max_matches),
-            "method": "playwright_dom_v7_match_anchor",
+            "method": "playwright_dom_v9_per_match_tournament",
             "scraped_at": now,
         })
         actor.log.info("Done.")
