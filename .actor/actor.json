@@ -1,0 +1,10 @@
+{
+  "actorSpecification": 1,
+  "name": "esb-odds-ggbet",
+  "title": "ESB Odds - GGBet",
+  "description": "Scrapes esports match odds from GGBet using Playwright DOM extraction",
+  "version": "1.0",
+  "buildTag": "latest",
+  "input": "./input_schema.json",
+  "dockerfile": "./Dockerfile"
+}

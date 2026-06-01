@@ -1,0 +1,39 @@
+{
+  "title": "GGBet Scraper Input",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "proxy_country": {
+      "title": "Proxy country",
+      "type": "string",
+      "description": "GGBet allowed geos: PL, SE, AT, LV, LT, EE, FI, DK, NO, IE, CA, NZ, HU, SK, RO, PH",
+      "default": "PL",
+      "editor": "textfield"
+    },
+    "proxyConfiguration": {
+      "title": "Proxy configuration",
+      "type": "object",
+      "description": "Apify proxy config — use RESIDENTIAL group with country from allowed list",
+      "editor": "proxy",
+      "prefill": {
+        "useApifyProxy": true,
+        "apifyProxyGroups": ["RESIDENTIAL"],
+        "apifyProxyCountry": "PL"
+      }
+    },
+    "max_matches": {
+      "title": "Max matches",
+      "type": "integer",
+      "description": "Maximum records to return",
+      "default": 500,
+      "editor": "number"
+    },
+    "debug": {
+      "title": "Debug mode",
+      "type": "boolean",
+      "description": "Save HTML/screenshots to key-value store for debugging",
+      "default": false,
+      "editor": "checkbox"
+    }
+  }
+}
