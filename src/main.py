@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 """
-GGBet (gg.bet) Esports Odds Scraper — v8 (2026-06-01)
+GGBet (gg.bet) Esports Odds Scraper — v10 (2026-06-01)
 
-DOM structure (confirmed):
-  Each match = <a data-test="sport-event-row-body-link" href="/pl/esports/match/...">
-  Inside each match: 18 odd-buttons (6 markets × 3 outcomes)
-  We want the first market (Match Winner = first 2 or 3 buttons)
+DOM structure (confirmed from live inspection):
+  Page layout per match:
+    DIV[data-test="sport-event-in-view-subscription"]
+      DIV  <- tournament name (only present on first match of each tournament block)
+      A[data-test="sport-event-row-body-link" href="/pl/esports/match/team1-vs-team2-DD-MM"]
+        ...18 odd-buttons (6 markets × 3 outcomes)...
 
-Fixes vs v6:
-  - Group by data-test="sport-event-row-body-link" anchor — exact match container
-  - Strip /pl/ locale prefix from match URLs
-  - Extract start time from within the match anchor
-  - Extract tournament from the section heading above each group of matches
-  - Match Winner = odd-buttons inside data-test="top-markets" only (first market block)
+Tournament fix: read from sport-event-in-view-subscription first child DIV, carry last seen
+Time fix: parse HH:MM from match innerText + DD-MM date from match URL href
 """
 import asyncio
 import logging
@@ -82,27 +80,48 @@ JS_DISCOVER_GAMES = """
 }
 """
 
-# Core extractor — uses confirmed DOM structure
 JS_EXTRACT = """
 () => {
     const records = [];
     const seen = new Set();
 
-    // Each match is wrapped in <a data-test="sport-event-row-body-link">
-    const matchLinks = document.querySelectorAll('a[data-test="sport-event-row-body-link"]');
+    // Walk all sport-event-in-view-subscription wrappers
+    // Each wrapper = one match; may have a tournament heading DIV as first child
+    const wrappers = document.querySelectorAll('[data-test="sport-event-in-view-subscription"]');
+    let lastTournament = '';
 
-    for (const matchEl of matchLinks) {
+    for (const wrapper of wrappers) {
+        // Tournament: first child DIV that isn't the match anchor
+        const children = Array.from(wrapper.children);
+        const matchEl = wrapper.querySelector('a[data-test="sport-event-row-body-link"]');
+        if (!matchEl) continue;
+
+        // Check if first child before the anchor has a tournament name
+        for (const child of children) {
+            if (child === matchEl || child.contains(matchEl)) break;
+            const t = child.textContent.trim().split('\\n')[0].trim();
+            // Valid tournament name: not a time, not too short, not just digits
+            if (t && t.length > 3 && t.length < 120 &&
+                !/^\\d{1,2}:\\d{2}$/.test(t) &&
+                !/^\\d+$/.test(t)) {
+                lastTournament = t;
+                break;
+            }
+        }
+        const tournament = lastTournament;
+
+        // Match URL — strip locale prefix
         const rawHref = matchEl.getAttribute('href') || '';
-        // Strip locale prefix: /pl/esports/match/... -> /esports/match/...
         const href = rawHref.replace(/^\\/[a-z]{2}\\//, '/');
         const matchUrl = href ? 'https://gg.bet' + href : '';
 
-        // Odd-buttons: only from the first market block (data-test="top-markets")
-        // Each market block is a DIV[data-test="top-markets"]
-        // The Match Winner market is the one with team names as labels
-        const allOddBtns = Array.from(matchEl.querySelectorAll('[data-test*="odd-button"]'));
+        // Start time from innerText first HH:MM
+        const allText = matchEl.innerText || '';
+        const timeMatch = allText.match(/(\\d{1,2}:\\d{2})/);
+        const startTime = timeMatch ? timeMatch[1] : '';
 
-        // Extract leaf text from each button: label + numeric value
+        // Parse all odd-buttons
+        const allOddBtns = Array.from(matchEl.querySelectorAll('[data-test*="odd-button"]'));
         const parsedBtns = [];
         const btnSeen = new Set();
         for (const btn of allOddBtns) {
@@ -125,16 +144,14 @@ JS_EXTRACT = """
             if (!btnSeen.has(k)) { btnSeen.add(k); parsedBtns.push({label, value}); }
         }
 
-        // Filter to Match Winner candidates: reject numeric labels, PL locale words, draw/over/under
+        // Keep only Match Winner: reject handicap/total/draw/PL-locale labels
         const invalidRe = /^[+\-]?\d+[.,]?\d*$|powyżej|poniżej|over|under|^(yes|no|draw|x|remis)$/i;
         const mw = parsedBtns.filter(o => o.label && !invalidRe.test(o.label.trim()));
-
         if (mw.length < 2) continue;
 
         const team1 = mw[0].label.trim();
         const p1    = mw[0].value;
         let team2, p2, pDraw = null;
-
         if (mw.length >= 3 && /^(draw|x|remis)$/i.test(mw[1].label.trim())) {
             pDraw = mw[1].value;
             team2 = mw[2].label.trim();
@@ -143,30 +160,7 @@ JS_EXTRACT = """
             team2 = mw[1].label.trim();
             p2    = mw[1].value;
         }
-
         if (!team1 || !team2 || team1.toLowerCase() === team2.toLowerCase()) continue;
-
-        // Start time — first line of innerText is always "HH:MM" (confirmed from DOM)
-        let startTime = '';
-        const allText = matchEl.innerText || '';
-        const timeMatch = allText.match(/(\d{1,2}:\d{2})/);
-        if (timeMatch) startTime = timeMatch[1];
-
-        // Tournament: walk up from matchEl to find a heading/label above the match group
-        let tournament = '';
-        let cur = matchEl.parentElement;
-        for (let i = 0; i < 10 && cur && cur !== document.body; i++) {
-            const h = cur.querySelector('h1,h2,h3,h4,[class*="sport-name"],[class*="SportName"],[class*="tournament"],[class*="league"],[class*="section-title"],[class*="group-title"]');
-            if (h) {
-                const t = h.textContent.trim().split('\\n')[0].trim();
-                if (t && t.length > 1 && t.length < 100 && !t.includes('GGBET')) {
-                    // Strip PL locale prefixes
-                    tournament = t.replace(/^(Obstawianie |Zakłady na |Obstawiaj |Bet on |Apostas em |Apuestas de )/i, '').trim();
-                    break;
-                }
-            }
-            cur = cur.parentElement;
-        }
 
         const key = team1.toLowerCase() + '|' + team2.toLowerCase();
         if (!seen.has(key)) {
@@ -194,6 +188,21 @@ async () => {
     return document.querySelectorAll('a[data-test="sport-event-row-body-link"]').length;
 }
 """
+
+# Parse "DD-MM" from match URL slug, combine with scraped_at year
+MATCH_DATE_RE = re.compile(r"-(\d{2})-(\d{2})$")
+
+
+def enrich_start_time(start_time: str, match_url: str, scraped_at: str) -> str:
+    """Combine HH:MM with DD-MM from match URL slug → 'YYYY-MM-DD HH:MM'."""
+    if not start_time:
+        return ""
+    m = MATCH_DATE_RE.search(match_url)
+    if not m:
+        return start_time
+    day, month = m.group(1), m.group(2)
+    year = scraped_at[:4]
+    return f"{year}-{month}-{day} {start_time}"
 
 
 def is_virtual(tournament: str, game_label: str) -> bool:
@@ -243,10 +252,14 @@ async def scrape_game_page(page, game_label: str, url: str, now: str) -> List[Di
             team2      = (item.get("team2") or "").strip()
             tournament = (item.get("tournament") or "").strip()
             p1, p2     = item.get("p1"), item.get("p2")
+            match_url  = item.get("matchUrl") or ""
             if not team1 or not team2 or not p1 or not p2:
                 continue
             if is_virtual(tournament, game_label):
                 continue
+            start_time = enrich_start_time(
+                (item.get("startTime") or "").strip(), match_url, now
+            )
             records.append({
                 "bookmaker":        "ggbet",
                 "game_raw":         game_label,
@@ -254,8 +267,8 @@ async def scrape_game_page(page, game_label: str, url: str, now: str) -> List[Di
                 "tournament_name":  tournament,
                 "team1":            team1,
                 "team2":            team2,
-                "match_start_time": (item.get("startTime") or "").strip(),
-                "match_url":        item.get("matchUrl") or "",
+                "match_start_time": start_time,
+                "match_url":        match_url,
                 "market_name":      "Match Winner",
                 "price_team1":      p1,
                 "price_team2":      p2,
@@ -271,7 +284,7 @@ async def main() -> None:
     async with Actor() as actor:
         inp         = await actor.get_input() or {}
         max_matches = inp.get("max_matches", 1000)
-        actor.log.info(f"GGBet DOM scraper v8 | sport-event-row-body-link | max={max_matches}")
+        actor.log.info(f"GGBet DOM scraper v10 | tournament+datetime fix | max={max_matches}")
 
         now = datetime.now(timezone.utc).isoformat()
         all_records: List[Dict] = []
@@ -328,7 +341,7 @@ async def main() -> None:
         await actor.push_data({
             "_meta": True, "bookmaker": "ggbet",
             "records_total": min(len(all_records), max_matches),
-            "method": "playwright_dom_v9_per_match_tournament",
+            "method": "playwright_dom_v10",
             "scraped_at": now,
         })
         actor.log.info("Done.")
