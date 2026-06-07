@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
-GGBet (gg.bet) Esports Odds Scraper — v10 (2026-06-01)
+GGBet (gg.bet) Esports Odds Scraper — v11 (2026-06-07)
+
+Schema: SCHEMA-LOCK-2026-06-07.md — all actors must conform.
+Changes in v11:
+  - `game_normalised` → `game` (canonical name via normalise_game)
+  - `match_start_time` now ISO 8601 UTC
+  - Added `market_name` field
 
 DOM structure (confirmed from live inspection):
   Page layout per match:
@@ -17,9 +23,12 @@ import logging
 import re
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple
+import sys
+from pathlib import Path
 
 from apify import Actor
 from playwright.async_api import async_playwright
+from normalise import normalise_game
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ggbet-scraper")
@@ -85,22 +94,17 @@ JS_EXTRACT = """
     const records = [];
     const seen = new Set();
 
-    // Walk all sport-event-in-view-subscription wrappers
-    // Each wrapper = one match; may have a tournament heading DIV as first child
     const wrappers = document.querySelectorAll('[data-test="sport-event-in-view-subscription"]');
     let lastTournament = '';
 
     for (const wrapper of wrappers) {
-        // Tournament: first child DIV that isn't the match anchor
         const children = Array.from(wrapper.children);
         const matchEl = wrapper.querySelector('a[data-test="sport-event-row-body-link"]');
         if (!matchEl) continue;
 
-        // Check if first child before the anchor has a tournament name
         for (const child of children) {
             if (child === matchEl || child.contains(matchEl)) break;
             const t = child.textContent.trim().split('\\n')[0].trim();
-            // Valid tournament name: not a time, not too short, not just digits
             if (t && t.length > 3 && t.length < 120 &&
                 !/^\\d{1,2}:\\d{2}$/.test(t) &&
                 !/^\\d+$/.test(t)) {
@@ -110,17 +114,14 @@ JS_EXTRACT = """
         }
         const tournament = lastTournament;
 
-        // Match URL — strip locale prefix
         const rawHref = matchEl.getAttribute('href') || '';
         const href = rawHref.replace(/^\\/[a-z]{2}\\//, '/');
         const matchUrl = href ? 'https://gg.bet' + href : '';
 
-        // Start time from innerText first HH:MM
         const allText = matchEl.innerText || '';
         const timeMatch = allText.match(/(\\d{1,2}:\\d{2})/);
         const startTime = timeMatch ? timeMatch[1] : '';
 
-        // Parse all odd-buttons
         const allOddBtns = Array.from(matchEl.querySelectorAll('[data-test*="odd-button"]'));
         const parsedBtns = [];
         const btnSeen = new Set();
@@ -144,8 +145,7 @@ JS_EXTRACT = """
             if (!btnSeen.has(k)) { btnSeen.add(k); parsedBtns.push({label, value}); }
         }
 
-        // Keep only Match Winner: reject handicap/total/draw/PL-locale labels
-        const invalidRe = /^[+\-]?\d+[.,]?\d*$|powyżej|poniżej|over|under|^(yes|no|draw|x|remis)$/i;
+        const invalidRe = /^[+\\-]?\\d+[.,]?\\d*$|powyżej|poniżej|over|under|^(yes|no|draw|x|remis)$/i;
         const mw = parsedBtns.filter(o => o.label && !invalidRe.test(o.label.trim()));
         if (mw.length < 2) continue;
 
@@ -189,12 +189,11 @@ async () => {
 }
 """
 
-# Parse "DD-MM" from match URL slug, combine with scraped_at year
 MATCH_DATE_RE = re.compile(r"-(\d{2})-(\d{2})$")
 
 
 def enrich_start_time(start_time: str, match_url: str, scraped_at: str) -> str:
-    """Combine HH:MM with DD-MM from match URL slug → 'YYYY-MM-DD HH:MM'."""
+    """Combine HH:MM with DD-MM from match URL slug → ISO 8601 UTC string."""
     if not start_time:
         return ""
     m = MATCH_DATE_RE.search(match_url)
@@ -202,7 +201,7 @@ def enrich_start_time(start_time: str, match_url: str, scraped_at: str) -> str:
         return start_time
     day, month = m.group(1), m.group(2)
     year = scraped_at[:4]
-    return f"{year}-{month}-{day} {start_time}"
+    return f"{year}-{month}-{day}T{start_time}:00Z"
 
 
 def is_virtual(tournament: str, game_label: str) -> bool:
@@ -263,7 +262,7 @@ async def scrape_game_page(page, game_label: str, url: str, now: str) -> List[Di
             records.append({
                 "bookmaker":        "ggbet",
                 "game_raw":         game_label,
-                "game_normalised":  game_label,
+                "game":             normalise_game(game_label),
                 "tournament_name":  tournament,
                 "team1":            team1,
                 "team2":            team2,
@@ -284,7 +283,7 @@ async def main() -> None:
     async with Actor() as actor:
         inp         = await actor.get_input() or {}
         max_matches = inp.get("max_matches", 1000)
-        actor.log.info(f"GGBet DOM scraper v10 | tournament+datetime fix | max={max_matches}")
+        actor.log.info(f"GGBet DOM scraper v11 | schema-locked | max={max_matches}")
 
         now = datetime.now(timezone.utc).isoformat()
         all_records: List[Dict] = []
@@ -341,7 +340,7 @@ async def main() -> None:
         await actor.push_data({
             "_meta": True, "bookmaker": "ggbet",
             "records_total": min(len(all_records), max_matches),
-            "method": "playwright_dom_v10",
+            "method": "playwright_dom_v11",
             "scraped_at": now,
         })
         actor.log.info("Done.")
