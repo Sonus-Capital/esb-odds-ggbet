@@ -54,7 +54,10 @@ ESPORT_GAMES_DEFAULT: List[Tuple[str, str]] = [
     ("Call of Duty",  f"{GG_BET_URL}/call-of-duty"),
     ("Rocket League", f"{GG_BET_URL}/rocket-league"),
     ("StarCraft 2",   f"{GG_BET_URL}/starcraft2"),
+    ("PUBG",          f"{GG_BET_URL}/battlegrounds"),
+    ("King of Glory", f"{GG_BET_URL}/king-of-glory"),
 ]
+
 
 VIRTUAL_RE = re.compile(
     r"EA FC|2x\d+ min|eSoccer|efootball|eFootball|NBA 2K|"
@@ -75,7 +78,7 @@ JS_DISCOVER_GAMES = """
     const seen = new Set();
     const slugs = ['counter-strike','cs2','dota2','valorant','league-of-legends',
         'mobile-legends','overwatch','rainbow-six','call-of-duty','rocket-league',
-        'starcraft2','pubg','king-of-glory'];
+        'starcraft2','battlegrounds','king-of-glory'];
     const results = [];
     document.querySelectorAll('a[href]').forEach(a => {
         const href = a.getAttribute('href') || '';
@@ -315,7 +318,17 @@ async def main() -> None:
 
             try:
                 discovered = await page.evaluate(JS_DISCOVER_GAMES)
-                game_list = [(r["text"], r["url"]) for r in discovered] if discovered and len(discovered) >= 3 else ESPORT_GAMES_DEFAULT
+                # Merge discovered games over the default list (never replace it):
+                # gg.bet's /esports nav only surfaces games with featured content,
+                # so seasonal games (PUBG, King of Glory) vanish from discovery
+                # even when odds exist on their dedicated pages.
+                game_list = list(ESPORT_GAMES_DEFAULT)
+                seen_urls = {u for _, u in game_list}
+                if discovered:
+                    for r in discovered:
+                        if r["url"] not in seen_urls:
+                            game_list.append((r["text"], r["url"]))
+                            seen_urls.add(r["url"])
                 actor.log.info(f"Game list: {[g for g, _ in game_list]}")
             except Exception:
                 game_list = ESPORT_GAMES_DEFAULT
